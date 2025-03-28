@@ -1,0 +1,124 @@
+name: Build, Version, and Deploy to GCloud Compute Engine
+
+on:
+  push:
+    branches:
+      - "release*"
+
+jobs:
+  build_and_deploy:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        node-version: [20.x]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: 1. Fetch all tags
+        run: git fetch --tags
+
+      - name: 2. Set up Node.js
+        uses: actions/setup-node@v4.0.3
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: 3. Install dependencies
+        run: npm install
+
+      - name: 4. Build project (Vite SSR)
+        run: npm run build
+
+      - name: 5. Get latest release version
+        id: get_version
+        run: |
+          latest_tag=$(git tag --list "v*" --sort=-v:refname | head -n 1)
+          if [ -z "$latest_tag" ]; then
+            new_version="0.0.1"
+          else
+            IFS='.' read -r major minor patch <<< "${latest_tag#v}"
+            patch=$((patch + 1))
+            new_version="${major}.${minor}.${patch}"
+          fi
+          echo "NEW_VERSION=v${new_version}" >> $GITHUB_ENV
+          echo "new_version=${new_version}" >> $GITHUB_ENV
+          echo "New version will be: $new_version"
+
+      - name: 6. Check if tag exists in the remote
+        id: check_tag
+        run: |
+          if git ls-remote --tags origin | grep -q "refs/tags/${{ env.NEW_VERSION }}"; then
+            echo "Tag ${{ env.NEW_VERSION }} already exists in the remote."
+            exit 1
+          else
+            echo "Tag ${{ env.NEW_VERSION }} does not exist in the remote."
+          fi
+
+      - name: 7. Tag the new release
+        if: steps.check_tag.outcome == 'success'
+        run: |
+          git config user.name "Sultan-dev"
+          git config user.email "Sultan.Bus@outlook.com"
+          git tag ${{ env.NEW_VERSION }}
+          git push origin ${{ env.NEW_VERSION }}
+
+      - name: 8. Prepare full deployment package
+        run: |
+          mkdir -p deployment/${{ env.NEW_VERSION }}
+          cp -r dist package.json package-lock.json server.js deployment/${{ env.NEW_VERSION }}/
+
+      - name: 9. Confirm local folder to upload
+        run: |
+          echo "Deployment package contents:"
+          ls -la ./deployment/${{ env.NEW_VERSION }}
+          ls -la ./deployment/${{ env.NEW_VERSION }}/dist
+
+      - name: 10. Authenticate to Google Cloud
+        uses: google-github-actions/auth@v1
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: 11. Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v1
+        with:
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: 12. Ensure remote deployment folder exists
+        run: |
+          gcloud compute ssh USERNAME@VM_NAME --zone=YOUR_VM_ZONE \
+            --command "mkdir -p ~/deployment"
+
+      - name: 13. Upload versioned folder to VM
+        run: |
+          gcloud compute scp --recurse ./deployment/${{ env.NEW_VERSION }} \
+            USERNAME@VM_NAME:~/deployment --zone=YOUR_VM_ZONE
+
+      - name: 14. Confirm uploaded content on VM
+        run: |
+          gcloud compute ssh USERNAME@VM_NAME --zone=YOUR_VM_ZONE \
+            --command "ls -la ~/deployment/${{ env.NEW_VERSION }} && ls -la ~/deployment/${{ env.NEW_VERSION }}/dist"
+
+      - name: 15. Delete old deployments (keep latest only)
+        run: |
+          gcloud compute ssh USERNAME@VM_NAME --zone=YOUR_VM_ZONE \
+            --command "
+              cd ~/deployment && \
+              ls -1d v* | sort -V | grep -v '${{ env.NEW_VERSION }}' | xargs -r rm -rf
+            "
+
+      - name: 16. Move app to production folder and install dependencies
+        run: |
+          gcloud compute ssh USERNAME@VM_NAME --zone=YOUR_VM_ZONE \
+            --command "rm -rf ~/app && cp -r ~/deployment/${{ env.NEW_VERSION }} ~/app && cd ~/app && NODE_ENV=production npm install --omit=dev"
+
+      - name: 17. Restart app with PM2 (Runs npm start)
+        run: |
+          gcloud compute ssh USERNAME@VM_NAME --zone=YOUR_VM_ZONE \
+            --command "
+              cd ~/app && \
+              pm2 delete survey-app || true && \
+              pm2 start npm --name survey-app -- start && \
+              pm2 save
+            "
